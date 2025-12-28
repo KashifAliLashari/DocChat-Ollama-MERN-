@@ -28,18 +28,65 @@ def _chroma_vector_store(collection_name: str = "documents") -> ChromaVectorStor
     return ChromaVectorStore(chroma_collection=collection)
 
 
+def _extract_domain(url: str) -> str:
+    """Extract a clean domain name from URL for labeling."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # Remove www. prefix
+        if domain.startswith("www."):
+            domain = domain[4:]
+        # Map common domains to friendly names
+        domain_map = {
+            "github.com": "GitHub",
+            "linkedin.com": "LinkedIn",
+            "coursera.org": "Coursera",
+            "cloudskillsboost.google": "Google Cloud Skills",
+            "credly.com": "Credly",
+            "credential.net": "Credential.net",
+            "udemy.com": "Udemy",
+            "edx.org": "edX",
+            "kaggle.com": "Kaggle",
+        }
+        for key, friendly in domain_map.items():
+            if key in domain:
+                return friendly
+        # Return cleaned domain if no mapping
+        return domain.split(".")[0].capitalize()
+    except:
+        return "Link"
+
+
 def _parse_pdf(path: Path, name: str, document_id: str) -> List[Document]:
-    """Extract per-page documents with metadata for citations."""
+    """Extract per-page documents with metadata for citations, including hyperlinks."""
     doc = fitz.open(path)
     documents: List[Document] = []
     for page in doc:
         page_text = page.get_text("text")
-        text = f"Source: {name}\nPage: {page.number + 1}\n{page_text}"
-        if not text.strip():
+        
+        # Extract unique hyperlinks from the page (deduplicated by URL)
+        links = page.get_links()
+        seen_urls = set()
+        link_texts = []
+        for link in links:
+            uri = link.get("uri")
+            if uri and uri not in seen_urls:
+                seen_urls.add(uri)
+                # Use domain name as the label
+                label = _extract_domain(uri)
+                link_texts.append(f"- [{label}]({uri})")
+        
+        # Combine page text with extracted links
+        full_text = f"Source: {name}\nPage: {page.number + 1}\n{page_text}"
+        if link_texts:
+            full_text += f"\n\nLinks found on this page:\n" + "\n".join(link_texts)
+        
+        if not full_text.strip():
             continue
         documents.append(
             Document(
-                text=text,
+                text=full_text,
                 metadata={
                     "document_id": document_id,
                     "source": name,
@@ -98,16 +145,28 @@ def get_document_chunks(document_id: str | None = None, source_name: str | None 
     client = get_chroma_client()
     collection = client.get_or_create_collection(name="documents")
     
+    # Debug: Show what's in the collection
+    all_data = collection.get(include=["metadatas"])
+    print(f"[DEBUG] ChromaDB collection has {len(all_data.get('ids', []))} total items")
+    if all_data.get("metadatas"):
+        unique_doc_ids = set(m.get("document_id") for m in all_data["metadatas"] if m)
+        unique_sources = set(m.get("source") for m in all_data["metadatas"] if m)
+        print(f"[DEBUG] Unique document_ids in DB: {unique_doc_ids}")
+        print(f"[DEBUG] Unique sources in DB: {unique_sources}")
+    
     where_filter = None
     if document_id:
         where_filter = {"document_id": document_id}
     elif source_name:
         where_filter = {"source": source_name}
     
+    print(f"[DEBUG] Querying with filter: {where_filter}")
+    
     if not where_filter:
         return []
     
     results = collection.get(where=where_filter, include=["documents", "metadatas"])
+    print(f"[DEBUG] Query returned {len(results.get('documents', []))} documents")
     
     chunks = []
     if results and results.get("documents"):

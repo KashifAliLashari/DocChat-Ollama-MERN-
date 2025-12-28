@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { ArrowUpRight, Book, MessageSquare, Plus, Square } from 'lucide-react'
+import { ArrowUpRight, Book, Copy, Check, Download, MessageSquare, Moon, Pencil, Plus, RefreshCw, Square, Sun } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import './App.css'
 
 type DocumentRecord = {
@@ -141,6 +143,36 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+function getFriendlyError(error: unknown): string {
+  const msg = String(error).toLowerCase()
+
+  if (msg.includes('failed to fetch') || msg.includes('network') || msg.includes('econnrefused')) {
+    return 'Cannot connect to server. Please ensure the backend is running.'
+  }
+  if (msg.includes('ollama') || msg.includes('connection') && msg.includes('11434')) {
+    return 'Ollama is not running. Please start Ollama and try again.'
+  }
+  if (msg.includes('embedding')) {
+    return 'Embedding model not available. Run: ollama pull nomic-embed-text'
+  }
+  if (msg.includes('413') || msg.includes('too large')) {
+    return 'File too large. Please upload a smaller PDF.'
+  }
+  if (msg.includes('404') || msg.includes('not found')) {
+    return 'Resource not found. It may have been deleted.'
+  }
+  if (msg.includes('timeout')) {
+    return 'Request timed out. Please try again.'
+  }
+  if (msg.includes('pdf') || msg.includes('parse')) {
+    return 'Failed to process PDF. The file may be corrupted or password-protected.'
+  }
+
+  // Return original if no match, but clean it up
+  const original = String(error)
+  return original.replace(/^Error:\s*/i, '').slice(0, 150)
+}
+
 function App() {
   const [docs, setDocs] = useState<DocumentRecord[]>([])
   const [conversations, setConversations] = useState<ConversationRecord[]>([])
@@ -163,13 +195,31 @@ function App() {
   >({})
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingText, setEditingText] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [ollamaStatus, setOllamaStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking')
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameText, setRenameText] = useState('')
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('darkMode')
+    return saved === 'true'
+  })
   const abortRef = useRef<AbortController | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement | null>(null)
 
   const apiDocsUrl = useMemo(() => `${API_BASE}/documents`, [])
   const apiConversationsUrl = useMemo(() => `${API_BASE}/conversations`, [])
   const apiUploadUrl = useMemo(() => `${API_BASE}/documents/upload`, [])
   const apiChatUrl = useMemo(() => `${API_BASE}/chat/stream`, [])
+
+  const filteredConversations = useMemo(() => {
+    if (!searchQuery.trim()) return conversations
+    const q = searchQuery.toLowerCase()
+    return conversations.filter((c) =>
+      (c.title || 'Conversation').toLowerCase().includes(q)
+    )
+  }, [conversations, searchQuery])
 
   useEffect(() => {
     // Always land in a fresh chat on load/refresh
@@ -188,6 +238,43 @@ function App() {
     void refreshDocs()
     void refreshConversations()
   }, [])
+
+  // Check Ollama status on mount and every 30 seconds
+  useEffect(() => {
+    async function checkOllama() {
+      try {
+        const res = await fetch(`${API_BASE}/health/ollama`)
+        if (!res.ok) {
+          setOllamaStatus('disconnected')
+          return
+        }
+        // Read the full SSE response as text
+        const text = await res.text()
+        // Check for status ok (with or without spaces in JSON)
+        if (text.includes('"status": "ok"') || text.includes('"status":"ok"')) {
+          setOllamaStatus('connected')
+        } else {
+          setOllamaStatus('disconnected')
+        }
+      } catch {
+        setOllamaStatus('disconnected')
+      }
+    }
+    checkOllama()
+    const interval = setInterval(checkOllama, 30000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Auto-scroll to bottom when messages change or streaming
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, streamingText])
+
+  // Dark mode persistence and application
+  useEffect(() => {
+    localStorage.setItem('darkMode', String(darkMode))
+    document.documentElement.classList.toggle('dark', darkMode)
+  }, [darkMode])
 
   const attachmentForConversation = (id: string): AttachmentInfo | undefined =>
     conversationAttachments[id]
@@ -274,7 +361,7 @@ function App() {
       }))
     } catch (err) {
       console.error('Upload failed', err)
-      setUploadError(String(err))
+      setUploadError(getFriendlyError(err))
     }
   }
 
@@ -297,15 +384,20 @@ function App() {
     return carry
   }
 
-  async function handleChat(e?: FormEvent, override?: string, opts?: { appendUser?: boolean }) {
+  async function handleChat(
+    e?: FormEvent,
+    override?: string,
+    opts?: { appendUser?: boolean; sourceName?: string; sourceId?: string }
+  ) {
     if (e) e.preventDefault()
     const textToSend = (override ?? message).trim()
     if (!textToSend || streaming) return
 
     const convAttachment = attachmentForConversation(conversationId)
     const attachmentName =
-      uploadedFileName || convAttachment?.name || lastUsedFileName || undefined
-    const attachmentId = uploadedDocumentId || convAttachment?.id || lastUsedDocumentId || undefined
+      opts?.sourceName || uploadedFileName || convAttachment?.name || lastUsedFileName || undefined
+    const attachmentId =
+      opts?.sourceId || uploadedDocumentId || convAttachment?.id || lastUsedDocumentId || undefined
 
     abortRef.current?.abort()
     const controller = new AbortController()
@@ -362,9 +454,7 @@ function App() {
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         console.error('Chat failed', err)
-        setChatError(
-          'Chat failed. Please ensure Ollama is running and the embedding model is available.'
-        )
+        setChatError(getFriendlyError(err))
       }
     } finally {
       setStreaming(false)
@@ -391,8 +481,101 @@ function App() {
       await refreshConversations()
     } catch (err) {
       console.error('Failed to delete conversation', err)
-      setChatError('Failed to delete conversation')
+      setChatError(getFriendlyError(err))
     }
+  }
+
+  async function handleDeleteDocument(id: string) {
+    try {
+      await fetchJson<{ status: string }>(`${API_BASE}/documents/${id}`, {
+        method: 'DELETE',
+      })
+      await refreshDocs()
+    } catch (err) {
+      console.error('Failed to delete document', err)
+      setUploadError(getFriendlyError(err))
+    }
+  }
+
+  async function handleCopyMessage(id: string, content: string) {
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch (err) {
+      console.error('Failed to copy', err)
+    }
+  }
+
+  async function handleRenameConversation(id: string, newTitle: string) {
+    if (!newTitle.trim()) {
+      setRenamingId(null)
+      return
+    }
+    try {
+      await fetchJson(`${API_BASE}/conversations/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle.trim() }),
+      })
+      await refreshConversations()
+      setRenamingId(null)
+      setRenameText('')
+    } catch (err) {
+      console.error('Failed to rename conversation', err)
+      setChatError(getFriendlyError(err))
+    }
+  }
+
+  function handleExportChat() {
+    if (messages.length === 0) return
+
+    const currentConvo = conversations.find((c) => c.id === conversationId)
+    const title = currentConvo?.title || 'Conversation'
+    const timestamp = new Date().toISOString().split('T')[0]
+
+    let markdown = `# ${title}\n\nExported: ${timestamp}\n\n---\n\n`
+
+    for (const msg of messages) {
+      const role = msg.role === 'user' ? '**You**' : '**Assistant**'
+      const time = new Date(msg.created_at).toLocaleTimeString()
+      markdown += `### ${role} (${time})\n\n${msg.content}\n\n---\n\n`
+    }
+
+    const blob = new Blob([markdown], { type: 'text/markdown' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}_${timestamp}.md`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  async function handleRegenerateResponse(assistantMsgIndex: number) {
+    // Find the user message before this assistant message
+    let userMessage = ''
+    for (let i = assistantMsgIndex - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        userMessage = messages[i].content
+        break
+      }
+    }
+    if (!userMessage) return
+
+    // Remove the assistant message we're regenerating
+    setMessages((prev) => prev.filter((_, idx) => idx !== assistantMsgIndex))
+
+    // Get attachment for this conversation
+    const attachment = attachmentForConversation(conversationId)
+
+    // Resend with the same user message
+    await handleChat(undefined, userMessage, {
+      appendUser: false,
+      sourceName: attachment?.name,
+      sourceId: attachment?.id,
+    })
   }
 
   return (
@@ -419,20 +602,20 @@ function App() {
             <button
               className="nav-btn"
               onClick={() => {
-                setViewMode('chats')
-              }}
-            >
-              <MessageSquare size={18} />
-              {sidebarOpen && <span>Chats</span>}
-            </button>
-            <button
-              className="nav-btn"
-              onClick={() => {
                 setViewMode('docs')
               }}
             >
               <Book size={18} />
               {sidebarOpen && <span>Docs</span>}
+            </button>
+            <button
+              className="nav-btn"
+              onClick={() => {
+                setViewMode('chats')
+              }}
+            >
+              <MessageSquare size={18} />
+              {sidebarOpen && <span>Chats</span>}
             </button>
           </nav>
 
@@ -443,25 +626,58 @@ function App() {
               ) : (
                 conversations.map((c) => {
                   const isActive = c.id === conversationId
+                  const isRenaming = renamingId === c.id
                   return (
                     <div
                       key={c.id}
                       className={`chat-item ${isActive ? 'active' : ''}`}
-                      onClick={() => void handleSelectConversation(c.id)}
+                      onClick={() => !isRenaming && void handleSelectConversation(c.id)}
                       title={c.title || 'Conversation'}
                     >
-                      <div className="chat-name">{sidebarOpen ? c.title || 'Conversation' : ''}</div>
-                      {sidebarOpen && (
-                        <button
-                          className="ghost-btn small"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleDeleteConversation(c.id)
+                      {isRenaming ? (
+                        <input
+                          className="rename-input"
+                          value={renameText}
+                          onChange={(e) => setRenameText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              handleRenameConversation(c.id, renameText)
+                            } else if (e.key === 'Escape') {
+                              setRenamingId(null)
+                              setRenameText('')
+                            }
                           }}
-                          title="Delete conversation"
-                        >
-                          <TrashIcon />
-                        </button>
+                          onBlur={() => handleRenameConversation(c.id, renameText)}
+                          onClick={(e) => e.stopPropagation()}
+                          autoFocus
+                        />
+                      ) : (
+                        <div className="chat-name">{sidebarOpen ? c.title || 'Conversation' : ''}</div>
+                      )}
+                      {sidebarOpen && !isRenaming && (
+                        <div className="chat-item-actions">
+                          <button
+                            className="ghost-btn small"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setRenamingId(c.id)
+                              setRenameText(c.title || '')
+                            }}
+                            title="Rename conversation"
+                          >
+                            <Pencil size={12} />
+                          </button>
+                          <button
+                            className="ghost-btn small"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleDeleteConversation(c.id)
+                            }}
+                            title="Delete conversation"
+                          >
+                            <TrashIcon />
+                          </button>
+                        </div>
                       )}
                     </div>
                   )
@@ -471,13 +687,38 @@ function App() {
           </div>
 
           <div className="sidebar-footer">
-            <div className="avatar">K</div>
-            {sidebarOpen && (
-              <div className="profile">
-                <div className="profile-name">Kashif</div>
-                <div className="profile-plan">Free plan</div>
-              </div>
-            )}
+            <div className="status-row">
+              <span
+                className={`status-dot ${ollamaStatus}`}
+                title={`Ollama: ${ollamaStatus}`}
+              />
+              {sidebarOpen && (
+                <span className="status-text">
+                  {ollamaStatus === 'connected'
+                    ? 'Ollama connected'
+                    : ollamaStatus === 'checking'
+                      ? 'Checking...'
+                      : 'Ollama disconnected'}
+                </span>
+              )}
+            </div>
+            <button
+              className="theme-toggle"
+              onClick={() => setDarkMode(!darkMode)}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+              {sidebarOpen && <span>{darkMode ? 'Light mode' : 'Dark mode'}</span>}
+            </button>
+            <div className="profile-row">
+              <div className="avatar">A</div>
+              {sidebarOpen && (
+                <div className="profile">
+                  <div className="profile-name">Abudllah</div>
+                  <div className="profile-plan">Elite Plan</div>
+                </div>
+              )}
+            </div>
           </div>
         </aside>
 
@@ -491,27 +732,36 @@ function App() {
                   <span>New chat</span>
                 </button>
               </div>
-              <input className="search" placeholder="Search your chats..." disabled />
+              <input
+                className="search"
+                placeholder="Search your chats..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
               <div className="list-items">
-                {conversations.map((c) => (
-                  <div
-                    key={c.id}
-                    className="list-row"
-                    onClick={() => void handleSelectConversation(c.id)}
-                  >
-                    <div className="list-title">{c.title || 'Conversation'}</div>
-                    <button
-                      className="ghost-btn small"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleDeleteConversation(c.id)
-                      }}
-                      title="Delete conversation"
+                {filteredConversations.length === 0 ? (
+                  <p className="muted">No chats found.</p>
+                ) : (
+                  filteredConversations.map((c) => (
+                    <div
+                      key={c.id}
+                      className="list-row"
+                      onClick={() => void handleSelectConversation(c.id)}
                     >
-                      ⋯
-                    </button>
-                  </div>
-                ))}
+                      <div className="list-title">{c.title || 'Conversation'}</div>
+                      <button
+                        className="ghost-btn small"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleDeleteConversation(c.id)
+                        }}
+                        title="Delete conversation"
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           )}
@@ -521,7 +771,12 @@ function App() {
               <div className="list-view-header">
                 <h1>Documents</h1>
               </div>
-              {uploadError && <div className="alert error">Upload failed: {uploadError}</div>}
+              {uploadError && (
+                <div className="alert error">
+                  <span>{uploadError}</span>
+                  <button className="alert-dismiss" onClick={() => setUploadError(null)}>×</button>
+                </div>
+              )}
               <div className="list-items">
                 {docs.length === 0 ? (
                   <p className="muted">No documents yet.</p>
@@ -529,7 +784,16 @@ function App() {
                   docs.map((doc) => (
                     <div key={doc.id} className="list-row">
                       <div className="list-title">{doc.name}</div>
-                      <div className="list-sub">{new Date(doc.created_at).toLocaleString()}</div>
+                      <div className="list-row-actions">
+                        <div className="list-sub">{new Date(doc.created_at).toLocaleDateString()}</div>
+                        <button
+                          className="ghost-btn small"
+                          onClick={() => handleDeleteDocument(doc.id)}
+                          title="Delete document"
+                        >
+                          <TrashIcon size={14} />
+                        </button>
+                      </div>
                     </div>
                   ))
                 )}
@@ -539,6 +803,18 @@ function App() {
 
           {viewMode === 'chat' && (
             <div className="chat-window">
+              {messages.length > 0 && (
+                <div className="chat-header">
+                  <button
+                    className="chat-header-btn"
+                    onClick={handleExportChat}
+                    title="Export conversation"
+                  >
+                    <Download size={16} />
+                    <span>Export</span>
+                  </button>
+                </div>
+              )}
               {messages.length === 0 && (
                 <div className="empty-chat-hint">Start a conversation by typing a message.</div>
               )}
@@ -585,31 +861,92 @@ function App() {
                           </div>
                         ) : (
                           <>
-                            {m.content}
-                            {isUser && (
-                              <button
-                                className="edit-btn"
-                                type="button"
-                                onClick={() => {
-                                  setEditingId(m.id)
-                                  setEditingText(m.content)
+                            {isUser ? (
+                              m.content
+                            ) : (
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                components={{
+                                  a: ({ href, children }) => (
+                                    <a href={href} target="_blank" rel="noopener noreferrer">
+                                      {children}
+                                    </a>
+                                  ),
                                 }}
-                                title="Edit and resend"
                               >
-                                <PencilIcon size={14} />
-                              </button>
+                                {m.content}
+                              </ReactMarkdown>
                             )}
+                            <div className="msg-actions">
+                              <button
+                                className="msg-action-btn"
+                                type="button"
+                                onClick={() => handleCopyMessage(m.id, m.content)}
+                                title={copiedId === m.id ? 'Copied!' : 'Copy message'}
+                              >
+                                {copiedId === m.id ? <Check size={14} /> : <Copy size={14} />}
+                              </button>
+                              {isUser ? (
+                                <button
+                                  className="msg-action-btn"
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingId(m.id)
+                                    setEditingText(m.content)
+                                  }}
+                                  title="Edit and resend"
+                                >
+                                  <PencilIcon size={14} />
+                                </button>
+                              ) : (
+                                <button
+                                  className="msg-action-btn"
+                                  type="button"
+                                  onClick={() => {
+                                    const idx = messages.findIndex((msg) => msg.id === m.id)
+                                    if (idx >= 0) handleRegenerateResponse(idx)
+                                  }}
+                                  title="Regenerate response"
+                                  disabled={streaming}
+                                >
+                                  <RefreshCw size={14} />
+                                </button>
+                              )}
+                            </div>
                           </>
                         )}
                       </div>
                     </div>
                   )
                 })}
-                {streamingText && (
+                {streaming && !streamingText && (
                   <div className="msg assistant">
-                    <div className="bubble">{streamingText}</div>
+                    <div className="bubble typing-indicator">
+                      <span></span>
+                      <span></span>
+                      <span></span>
+                    </div>
                   </div>
                 )}
+                {streamingText && (
+                  <div className="msg assistant">
+                    <div className="bubble">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ href, children }) => (
+                            <a href={href} target="_blank" rel="noopener noreferrer">
+                              {children}
+                            </a>
+                          ),
+                        }}
+                      >
+                        {streamingText}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
               </div>
               <form className="chat-input" onSubmit={handleChat}>
                 <input
@@ -675,7 +1012,12 @@ function App() {
                   </button>
                 </div>
               </form>
-              {chatError && <div className="alert error">Chat error: {chatError}</div>}
+              {chatError && (
+                <div className="alert error">
+                  <span>{chatError}</span>
+                  <button className="alert-dismiss" onClick={() => setChatError(null)}>×</button>
+                </div>
+              )}
             </div>
           )}
         </main>

@@ -119,6 +119,17 @@ def list_documents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return cur.fetchall()
 
 
+def delete_document(conn: sqlite3.Connection, document_id: str) -> bool:
+    """Delete a document by ID. Returns True if deleted, False if not found."""
+    cur = conn.execute("SELECT path FROM documents WHERE id = ?", (document_id,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+    conn.commit()
+    return True
+
+
 def list_conversations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Return all conversations ordered by creation time desc."""
     cur = conn.execute(
@@ -158,6 +169,18 @@ def delete_conversation(conn: sqlite3.Connection, conversation_id: str) -> bool:
         DELETE FROM conversations WHERE id = ?
         """,
         (conversation_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def rename_conversation(conn: sqlite3.Connection, conversation_id: str, new_title: str) -> bool:
+    """Rename a conversation. Returns True if updated."""
+    cur = conn.execute(
+        """
+        UPDATE conversations SET title = ? WHERE id = ?
+        """,
+        (new_title, conversation_id),
     )
     conn.commit()
     return cur.rowcount > 0

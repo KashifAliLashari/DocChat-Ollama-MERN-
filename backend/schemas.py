@@ -20,13 +20,14 @@ class ChatRequest(BaseModel):
     source_id: Optional[str] = Field(
         None, description="Optional document_id to scope retrieval to."
     )
-    source_name: Optional[str] = Field(
-        None, description="Optional source/file name to scope retrieval to."
-    )
 
 
 class ConversationDeleteResponse(BaseModel):
     deleted: bool
+
+
+class RenameConversationRequest(BaseModel):
+    title: str = Field(..., description="New title for the conversation.")
 
 
 class DocumentRecord(BaseModel):

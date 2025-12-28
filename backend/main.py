@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from . import schemas
 from .db import (
     delete_conversation,
+    delete_document,
     ensure_conversation,
     ensure_sqlite_path,
     get_connection,
@@ -21,6 +22,7 @@ from .db import (
     list_conversations,
     list_documents,
     list_messages,
+    rename_conversation,
     update_conversation_title_if_empty,
 )
 from .ollama_client import ping_ollama
@@ -72,6 +74,33 @@ async def health() -> dict:
         "embedding_model": settings.embedding_model,
         "ollama_host": settings.ollama_host,
         "ollama_model": settings.ollama_model,
+    }
+
+
+@app.get("/debug/chroma")
+async def debug_chroma() -> dict:
+    """Debug: show what's in ChromaDB."""
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(name="documents")
+    all_data = collection.get(include=["metadatas"])
+    
+    items = []
+    for i, meta in enumerate(all_data.get("metadatas", [])):
+        items.append({
+            "id": all_data["ids"][i] if all_data.get("ids") else None,
+            "document_id": meta.get("document_id") if meta else None,
+            "source": meta.get("source") if meta else None,
+            "page": meta.get("page") if meta else None,
+        })
+    
+    unique_doc_ids = list(set(m.get("document_id") for m in all_data.get("metadatas", []) if m))
+    unique_sources = list(set(m.get("source") for m in all_data.get("metadatas", []) if m))
+    
+    return {
+        "total_chunks": len(all_data.get("ids", [])),
+        "unique_document_ids": unique_doc_ids,
+        "unique_sources": unique_sources,
+        "sample_items": items[:10],  # First 10 items
     }
 
 
@@ -188,13 +217,23 @@ async def _chat_sse_stream(
     source_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat tokens via SSE while persisting messages."""
+    print(f"[DEBUG] _chat_sse_stream called with source_id={source_id}, source_name={source_name}")
     context_chunks = []
     
     # If a specific document is attached, retrieve ALL its chunks directly (no vector search)
-    if source_id or source_name:
+    # IMPORTANT: Use source_name (filename) as primary filter since document_id is per-chunk, not per-file
+    if source_name:
         raw_chunks = await asyncio.to_thread(
-            get_document_chunks, document_id=source_id, source_name=source_name
+            get_document_chunks, document_id=None, source_name=source_name
         )
+        print(f"[DEBUG] get_document_chunks by source_name returned {len(raw_chunks)} chunks")
+        context_chunks = raw_chunks
+    elif source_id:
+        # Fallback to document_id (will only return 1 chunk due to bug in data)
+        raw_chunks = await asyncio.to_thread(
+            get_document_chunks, document_id=source_id, source_name=None
+        )
+        print(f"[DEBUG] get_document_chunks by source_id returned {len(raw_chunks)} chunks")
         context_chunks = raw_chunks
     
     # If no attached doc or no chunks found, fallback to vector search
@@ -207,7 +246,25 @@ async def _chat_sse_stream(
         ]
 
     system_prompt = "You are a helpful assistant that answers using only provided context."
-    prompt = _build_prompt_from_chunks(user_message, context_chunks)
+    context_prompt = _build_prompt_from_chunks(user_message, context_chunks)
+
+    # Fetch conversation history for memory
+    history_rows = list_messages(db, conversation_id)
+    history_messages = []
+    for row in history_rows:
+        r = dict(row)
+        # Skip the current user message (already added to DB before this call)
+        if r["role"] == "user" and r["content"] == user_message:
+            continue
+        history_messages.append({"role": r["role"], "content": r["content"]})
+    
+    # Limit history to last 10 messages to avoid token overflow
+    history_messages = history_messages[-10:]
+
+    # Build full message list: system + history + current context prompt
+    messages_to_send = [{"role": "system", "content": system_prompt}]
+    messages_to_send.extend(history_messages)
+    messages_to_send.append({"role": "user", "content": context_prompt})
 
     client = ollama.Client(host=settings.ollama_host)
     accumulated: list[str] = []
@@ -218,10 +275,7 @@ async def _chat_sse_stream(
         try:
             for chunk in client.chat(
                 model=settings.ollama_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages_to_send,
                 stream=True,
             ):
                 token = chunk.get("message", {}).get("content", "")
@@ -242,7 +296,11 @@ async def _chat_sse_stream(
         payload = json.dumps({"token": token})
         yield f"data: {payload}\n\n"
 
+    # Wait for the Ollama thread to fully complete before saving
+    thread.join(timeout=5.0)
+    
     assistant_text = "".join(accumulated)
+    print(f"[DEBUG] Saving assistant message with {len(assistant_text)} chars")
     insert_message(db, str(uuid.uuid4()), conversation_id, "assistant", assistant_text)
 
 
@@ -275,11 +333,29 @@ async def get_documents(db=Depends(get_db)) -> list[schemas.DocumentRecord]:
     return [schemas.DocumentRecord(**dict(r)) for r in rows]
 
 
+@app.delete("/documents/{document_id}")
+async def remove_document(document_id: str, db=Depends(get_db)) -> dict:
+    """Delete a document by ID."""
+    deleted = delete_document(db, document_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"status": "deleted", "document_id": document_id}
+
+
 @app.get("/conversations", response_model=list[schemas.ConversationRecord])
 async def get_conversations(db=Depends(get_db)) -> list[schemas.ConversationRecord]:
     """List conversations."""
     rows = list_conversations(db)
     return [schemas.ConversationRecord(**dict(r)) for r in rows]
+
+
+@app.patch("/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, payload: schemas.RenameConversationRequest, db=Depends(get_db)) -> dict:
+    """Rename a conversation."""
+    updated = rename_conversation(db, conversation_id, payload.title)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "updated", "conversation_id": conversation_id, "title": payload.title}
 
 
 @app.get("/conversations/{conversation_id}/messages", response_model=list[schemas.MessageRecord])
